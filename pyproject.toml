@@ -1,0 +1,19 @@
+[project]
+name = "kate"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Sarah",email = "svanwart@unca.edu"}
+]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "sounddevice (>=0.5.3,<0.6.0)",
+    "numpy (>=2.3.4,<3.0.0)",
+    "matplotlib (>=3.10.7,<4.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

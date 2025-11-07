@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Microphone Abstract Visualizer</title>
+    <style>
+      :root {
+        --bg: #0b0b0b;
+        --fg: #fff;
+      }
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: system-ui, -apple-system, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial;
+      }
+      #ui {
+        position: absolute;
+        left: 12px;
+        top: 12px;
+        z-index: 20;
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        background: rgba(0, 0, 0, 0.35);
+        padding: 8px;
+        border-radius: 8px;
+        backdrop-filter: blur(6px);
+      }
+      button,
+      select {
+        background: rgba(255, 255, 255, 0.06);
+        color: white;
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        padding: 6px 10px;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+      button:active {
+        transform: translateY(1px);
+      }
+      #status {
+        font-size: 0.9rem;
+        color: #ddd;
+        margin-left: 6px;
+      }
+      canvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+      }
+      .hint {
+        font-size: 12px;
+        color: #bbb;
+        margin-left: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="ui">
+      <button id="startBtn">Start</button>
+      <select id="mode">
+        <option value="blobs">Blobs</option>
+        <option value="rings">Rings</option>
+        <option value="lines">Flow Lines</option>
+        <option value="mixed" selected>Mixed</option>
+      </select>
+      <div id="status">idle</div>
+      <div class="hint">Allow mic → make noise</div>
+    </div>
+    <canvas id="c"></canvas>
+
+    <script>
+      (async function () {
+        const canvas = document.getElementById("c");
+        const ctx = canvas.getContext("2d", { alpha: true });
+        const startBtn = document.getElementById("startBtn");
+        const statusEl = document.getElementById("status");
+        const modeSelect = document.getElementById("mode");
+
+        let audioCtx, analyser, sourceNode;
+        let freqData, timeData;
+        let rafId;
+        let width = 0,
+          height = 0;
+        let smoothedRms = 0;
+        let hueBase = 200;
+
+        function fitCanvas() {
+          const DPR = window.devicePixelRatio || 1;
+          width = window.innerWidth;
+          height = window.innerHeight;
+          canvas.style.width = width + "px";
+          canvas.style.height = height + "px";
+          canvas.width = Math.floor(width * DPR);
+          canvas.height = Math.floor(height * DPR);
+          ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+        }
+        fitCanvas();
+        window.addEventListener("resize", fitCanvas);
+
+        function rmsFromTimeDomain(arr) {
+          // arr is Uint8Array of [-1..1] mapped to [0..255]
+          let sum = 0;
+          for (let i = 0; i < arr.length; i++) {
+            const v = (arr[i] - 128) / 128;
+            sum += v * v;
+          }
+          return Math.sqrt(sum / arr.length);
+        }
+
+        function spectralCentroid(freqArr, sampleRate, fftSize) {
+          // freqArr is magnitudes per bin
+          let num = 0,
+            den = 0;
+          for (let i = 0; i < freqArr.length; i++) {
+            const mag = freqArr[i];
+            num += i * mag;
+            den += mag;
+          }
+          if (den === 0) return 0;
+          const centroidBin = num / den;
+          // convert bin -> freq
+          const nyquist = sampleRate / 2;
+          const centroidHz = (centroidBin / freqArr.length) * nyquist;
+          return centroidHz;
+        }
+
+        function map(value, inMin, inMax, outMin, outMax, clamp = true) {
+          let v = (value - inMin) / (inMax - inMin);
+          if (clamp) v = Math.max(0, Math.min(1, v));
+          return outMin + v * (outMax - outMin);
+        }
+
+        function pickColorFromHue(h, sat = 70, light = 50) {
+          return `hsl(${Math.round(h)}, ${sat}%, ${light}%)`;
+        }
+
+        function drawFrame() {
+          analyser.getByteTimeDomainData(timeData);
+          analyser.getByteFrequencyData(freqData);
+
+          // compute audio metrics
+          const rms = rmsFromTimeDomain(timeData); // 0..~0.7
+          smoothedRms = smoothedRms * 0.85 + rms * 0.15;
+
+          const centroidHz = spectralCentroid(
+            freqData,
+            audioCtx.sampleRate,
+            analyser.fftSize
+          );
+          // hue mapping: 80Hz (bass) -> 300Hz (mid) -> 4000Hz (treble)
+          const hue = map(centroidHz, 80, 4000, 220, 20); // invert for nicer palette
+          hueBase = hue;
+
+          // band energies
+          const lowEnd = Math.floor(freqData.length * 0.12);
+          const midStart = lowEnd;
+          const midEnd = Math.floor(freqData.length * 0.45);
+          const highStart = midEnd;
+
+          const low = avg(freqData.slice(0, lowEnd));
+          const mid = avg(freqData.slice(midStart, midEnd));
+          const high = avg(freqData.slice(highStart));
+
+          // fade background slightly to create trails
+          ctx.fillStyle = `rgba(5,5,8,${map(
+            smoothedRms,
+            0,
+            0.15,
+            0.05,
+            0.25,
+            true
+          )})`;
+          ctx.fillRect(0, 0, width, height);
+
+          const mode = modeSelect.value;
+
+          // dynamic params
+          const numShapes = Math.max(
+            1,
+            Math.floor(map(smoothedRms, 0, 0.4, 1, 18))
+          );
+          const baseSize = map(
+            smoothedRms,
+            0,
+            0.4,
+            Math.min(width, height) * 0.02,
+            Math.min(width, height) * 0.35
+          );
+          const time = performance.now() * 0.001;
+
+          if (mode === "blobs" || mode === "mixed") {
+            // draw soft blobs that pulse and orbit
+            for (let i = 0; i < numShapes; i++) {
+              const t = time * map(1 + (i % 3), 1, 3, 0.3, 1.6);
+              const angle = t * (0.3 + (i % 5) * 0.1) + i;
+              const radius =
+                Math.min(width, height) *
+                map(low, 0, 180, 0.06, 0.35, true) *
+                (1 + (i % 4) * 0.12);
+              const cx =
+                width / 2 +
+                Math.cos(angle) * (radius + Math.sin(t * 1.3 + i) * 50);
+              const cy =
+                height / 2 +
+                Math.sin(angle) * (radius + Math.cos(t * 1.1 + i) * 50);
+
+              const size =
+                baseSize * map(freqData[i % freqData.length], 0, 255, 0.4, 1.6);
+              const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, size * 1.2);
+              const h1 = hueBase + ((i * 11) % 40);
+              g.addColorStop(
+                0,
+                pickColorFromHue(h1, 80, map(mid, 0, 255, 60, 40))
+              );
+              g.addColorStop(
+                0.5,
+                pickColorFromHue(h1 + 30, 70, map(high, 0, 255, 55, 30))
+              );
+              g.addColorStop(1, `rgba(0,0,0,0)`);
+
+              ctx.globalCompositeOperation = "lighter";
+              ctx.fillStyle = g;
+              ctx.beginPath();
+              ctx.ellipse(
+                cx,
+                cy,
+                size,
+                size * map(1, 0, 1, 0.6, 1.1),
+                angle % Math.PI,
+                0,
+                Math.PI * 2
+              );
+              ctx.fill();
+            }
+          }
+
+          if (mode === "rings" || mode === "mixed") {
+            // concentric rings radiating outward on beats
+            const ringCount = Math.max(3, Math.floor(map(mid, 0, 200, 3, 12)));
+            for (let r = 0; r < ringCount; r++) {
+              const p = r / ringCount + time * 0.08;
+              const rad =
+                Math.abs(Math.sin(p * Math.PI * 2)) *
+                (Math.min(width, height) * 0.5 * map(low, 0, 200, 0.4, 1.1));
+              ctx.lineWidth =
+                map(r, 0, ringCount, 1, 8) * map(smoothedRms, 0, 0.4, 0.4, 2.2);
+              ctx.beginPath();
+              ctx.strokeStyle = `hsla(${hueBase + r * 8}, 80%, ${map(
+                mid,
+                0,
+                200,
+                60,
+                35
+              )}, ${map(1 - r / ringCount, 0, 1, 0.06, 0.35)})`;
+              ctx.arc(width / 2, height / 2, rad, 0, Math.PI * 2);
+              ctx.stroke();
+            }
+          }
+
+          if (mode === "lines" || mode === "mixed") {
+            // flowing lines influenced by waveform
+            ctx.globalCompositeOperation = "source-over";
+            ctx.lineWidth = Math.max(1, Math.floor(map(high, 0, 255, 0.5, 4)));
+            const waveAmp = map(
+              rms,
+              0,
+              0.2,
+              20,
+              Math.min(width, height) * 0.28
+            );
+            ctx.beginPath();
+            const step = Math.max(2, Math.floor(width / 120));
+            for (let x = 0; x < width; x += step) {
+              const idx = Math.floor((x / width) * timeData.length);
+              const sample = (timeData[idx] - 128) / 128;
+              const y =
+                height / 2 +
+                sample * waveAmp * (1 + Math.sin(time + x * 0.002));
+              if (x === 0) ctx.moveTo(x, y);
+              else ctx.lineTo(x, y);
+            }
+            ctx.strokeStyle = `hsla(${hueBase}, 70%, ${map(
+              smoothedRms,
+              0,
+              0.4,
+              55,
+              35
+            )}, 0.8)`;
+            ctx.stroke();
+            // mirrored
+            ctx.beginPath();
+            for (let x = 0; x < width; x += step) {
+              const idx = Math.floor((x / width) * timeData.length);
+              const sample = (timeData[idx] - 128) / 128;
+              const y =
+                height / 2 -
+                sample * waveAmp * (1 + Math.cos(time + x * 0.0017));
+              if (x === 0) ctx.moveTo(x, y);
+              else ctx.lineTo(x, y);
+            }
+            ctx.strokeStyle = `hsla(${(hueBase + 60) % 360}, 65%, ${map(
+              smoothedRms,
+              0,
+              0.4,
+              50,
+              30
+            )}, 0.6)`;
+            ctx.stroke();
+          }
+
+          // subtle vignette overlay for polish
+          ctx.globalCompositeOperation = "source-over";
+          const vgrad = ctx.createRadialGradient(
+            width / 2,
+            height / 2,
+            Math.min(width, height) * 0.1,
+            width / 2,
+            height / 2,
+            Math.max(width, height)
+          );
+          vgrad.addColorStop(0, "rgba(0,0,0,0)");
+          vgrad.addColorStop(1, "rgba(0,0,0,0.35)");
+          ctx.fillStyle = vgrad;
+          ctx.fillRect(0, 0, width, height);
+
+          // update status
+          statusEl.textContent = `rms:${smoothedRms.toFixed(
+            3
+          )} • centroid:${Math.round(centroidHz)}Hz • mode:${mode}`;
+          rafId = requestAnimationFrame(drawFrame);
+        }
+
+        function avg(arr) {
+          if (!arr || arr.length === 0) return 0;
+          let s = 0;
+          for (let i = 0; i < arr.length; i++) s += arr[i];
+          return s / arr.length;
+        }
+
+        async function start() {
+          if (audioCtx && audioCtx.state === "running") return;
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          try {
+            await audioCtx.resume();
+          } catch (e) {
+            /* ignore */
+          }
+
+          // get mic
+          let stream;
+          try {
+            stream = await navigator.mediaDevices.getUserMedia({
+              audio: { echoCancellation: true, noiseSuppression: true },
+              video: false,
+            });
+          } catch (e) {
+            alert(
+              "Microphone access denied or not available. Please allow microphone and try again."
+            );
+            console.error(e);
+            return;
+          }
+
+          sourceNode = audioCtx.createMediaStreamSource(stream);
+          analyser = audioCtx.createAnalyser();
+          analyser.fftSize = 2048; // good balance (can increase for resolution)
+          analyser.smoothingTimeConstant = 0.85;
+          sourceNode.connect(analyser);
+
+          freqData = new Uint8Array(analyser.frequencyBinCount);
+          timeData = new Uint8Array(analyser.fftSize);
+
+          // clear canvas
+          ctx.clearRect(0, 0, width, height);
+          // initial dark background
+          ctx.fillStyle = "#050508";
+          ctx.fillRect(0, 0, width, height);
+
+          if (rafId) cancelAnimationFrame(rafId);
+          rafId = requestAnimationFrame(drawFrame);
+        }
+
+        startBtn.addEventListener("click", async () => {
+          startBtn.disabled = true;
+          startBtn.textContent = "Starting...";
+          try {
+            await start();
+            startBtn.style.display = "none";
+          } catch (e) {
+            console.error(e);
+            startBtn.disabled = false;
+            startBtn.textContent = "Start";
+          }
+        });
+
+        // graceful stop on page hide
+        document.addEventListener("visibilitychange", () => {
+          if (document.hidden && audioCtx && audioCtx.state === "running") {
+            audioCtx.suspend();
+            statusEl.textContent = "suspended";
+          } else if (
+            !document.hidden &&
+            audioCtx &&
+            audioCtx.state === "suspended"
+          ) {
+            audioCtx.resume();
+            statusEl.textContent = "running";
+          }
+        });
+      })();
+    </script>
+  </body>
+</html>
